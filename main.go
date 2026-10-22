@@ -41,6 +41,9 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Muat ribuan domain temp-mail ke RAM sebelum server menerima request
+	validator.LoadDisposableDomains()
+	
 	mux := http.NewServeMux() // Jika Go versi < 1.22, gunakan http.NewServeMux()
 
 	// Daftarkan rute endpoint

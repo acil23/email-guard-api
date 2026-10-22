@@ -1,24 +1,27 @@
 package validator
 
 import (
+	"context"
+	"net"
 	"net/mail"
 	"strings"
+	"sync"
+	"time"
 )
 
-// Result adalah cetakan (Struct) untuk output JSON kita nanti.
-// Huruf awal nama field WAJIB Kapital (Public/Exported) agar bisa diubah jadi JSON!
 type Result struct {
-	Email             string `json:"email"`
-	IsValidSyntax     bool   `json:"is_valid_syntax"`
-	Username          string `json:"username,omitempty"`
-	Domain            string `json:"domain,omitempty"`
-	IsRoleAccount     bool   `json:"is_role_account"`
-	SuggestedDomain   string `json:"suggested_domain,omitempty"`
-	RiskScore         int    `json:"risk_score"` // 0 (Aman) - 100 (Berbahaya)
-	Recommendation    string `json:"recommendation"`
+	Email           string `json:"email"`
+	IsValidSyntax   bool   `json:"is_valid_syntax"`
+	Username        string `json:"username,omitempty"`
+	Domain          string `json:"domain,omitempty"`
+	IsRoleAccount   bool   `json:"is_role_account"`
+	IsDisposable    bool   `json:"is_disposable"`
+	HasMXRecord     bool   `json:"has_mx_record"`
+	SuggestedDomain string `json:"suggested_domain,omitempty"`
+	RiskScore       int    `json:"risk_score"`
+	Recommendation  string `json:"recommendation"`
 }
 
-// Kamus typo domain populer
 var domainTypos = map[string]string{
 	"gmial.com":  "gmail.com",
 	"gamil.com":  "gmail.com",
@@ -27,14 +30,21 @@ var domainTypos = map[string]string{
 	"outlok.com": "outlook.com",
 }
 
-// Daftar kata kunci email grup/kantor (bukan personal)
 var rolePrefixes = map[string]bool{
 	"admin": true, "support": true, "info": true,
 	"sales": true, "billing": true, "contact": true,
 	"help": true, "office": true, "hr": true,
 }
 
-// Analyze adalah fungsi utama yang akan dipanggil oleh HTTP Handler
+// checkMX melakukan kueri DNS dengan batas waktu maksimal 1.5 detik
+func checkMX(domain string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	mxRecords, err := net.DefaultResolver.LookupMX(ctx, domain)
+	return err == nil && len(mxRecords) != 0
+}
+
 func Analyze(rawEmail string) Result {
 	email := strings.TrimSpace(strings.ToLower(rawEmail))
 
@@ -44,7 +54,7 @@ func Analyze(rawEmail string) Result {
 		Recommendation: "allow",
 	}
 
-	// 1. Cek format email menggunakan standard library net/mail
+	// 1. Validasi Sintaks Dasar
 	_, err := mail.ParseAddress(email)
 	parts := strings.Split(email, "@")
 	if err != nil || len(parts) != 2 || !strings.Contains(parts[1], ".") {
@@ -58,17 +68,67 @@ func Analyze(rawEmail string) Result {
 	res.Username = parts[0]
 	res.Domain = parts[1]
 
-	// 2. Cek apakah email ini akun grup/kantor (Role Account)
-	if rolePrefixes[res.Username] {
-		res.IsRoleAccount = true
-		res.RiskScore += 20
-	}
-
-	// 3. Cek apakah ada typo di domain
+	// 2. Cek Typo Domain terlebih dahulu
 	if correctDomain, exists := domainTypos[res.Domain]; exists {
 		res.SuggestedDomain = correctDomain
-		res.RiskScore += 50
-		res.Recommendation = "flag_typo"
+	}
+
+	// 3. JALANKAN PENGECEKAN SECARA PARALEL DENGAN GOROUTINES
+	var wg sync.WaitGroup
+	var isRole, isDisp, hasMX bool
+
+	// Kita akan menjalankan 3 tugas secara bersamaan
+	wg.Add(3)
+
+	// Goroutine 1: Cek Role Account
+	go func() {
+		defer wg.Done()
+		isRole = rolePrefixes[res.Username]
+	}()
+
+	// Goroutine 2: Cek Temp-Mail / Disposable Domain
+	go func() {
+		defer wg.Done()
+		isDisp = IsDisposable(res.Domain)
+	}()
+
+	// Goroutine 3: Cek DNS MX Record ke jaringan internet
+	go func() {
+		defer wg.Done()
+		hasMX = checkMX(res.Domain)
+	}()
+
+	// Tunggu sampai ketiga Goroutine di atas selesai!
+	wg.Wait()
+
+	// 4. Gabungkan hasil & hitung skor risiko (Risk Score)
+	res.IsRoleAccount = isRole
+	res.IsDisposable = isDisp
+	res.HasMXRecord = hasMX
+
+	if res.IsDisposable {
+		res.RiskScore += 85
+	}
+	if !res.HasMXRecord {
+		res.RiskScore += 60
+	}
+	if res.SuggestedDomain != "" {
+		res.RiskScore += 40
+	}
+	if res.IsRoleAccount {
+		res.RiskScore += 15
+	}
+
+	// Batasi skor maksimal di angka 100
+	if res.RiskScore >= 100 {
+		res.RiskScore = 100
+	}
+
+	// Tentukan keputusan akhir (Recommendation)
+	if res.IsDisposable || !res.HasMXRecord || res.RiskScore >= 70 {
+		res.Recommendation = "block"
+	} else if res.SuggestedDomain != "" || res.RiskScore >= 30 {
+		res.Recommendation = "review"
 	}
 
 	return res
