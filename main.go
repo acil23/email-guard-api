@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
-	// Ganti "github.com/usernamekamu/email-guard-api" sesuai nama di go.mod kamu!
+	// Pastikan nama module sesuai dengan yang ada di file go.mod kamu!
+	"github.com/acil23/email-guard-api/internal/middleware"
 	"github.com/acil23/email-guard-api/internal/validator"
 )
 
 func verifyHandler(w http.ResponseWriter, r *http.Request) {
-	// Catat waktu mulai untuk mengukur kecepatan eksekusi Go
 	start := time.Now()
 
-	// Ambil parameter ?email=... dari URL
 	email := r.URL.Query().Get("email")
 	if email == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -26,30 +26,41 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Panggil fungsi Analyze dari package validator kita
 	result := validator.Analyze(email)
-
-	// Hitung durasi proses dalam mikrodetik/milidetik
 	duration := time.Since(start).String()
 
-	// Set Header sebagai JSON dan tambahkan info kecepatan di Header
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Response-Time", duration)
-
-	// Kirim hasil dalam bentuk JSON
 	json.NewEncoder(w).Encode(result)
 }
 
-func main() {
-	// Muat ribuan domain temp-mail ke RAM sebelum server menerima request
-	validator.LoadDisposableDomains()
-	
-	mux := http.NewServeMux() // Jika Go versi < 1.22, gunakan http.NewServeMux()
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":                "healthy",
+		"loaded_temp_domains":   validator.GetDomainCount(),
+		"timestamp":             time.Now().UTC().Format(time.RFC3339),
+	})
+}
 
-	// Daftarkan rute endpoint
+func main() {
+	// 1. Jalankan pemuat database temp-mail & auto-update setiap 24 jam
+	validator.StartAutoUpdater(24 * time.Hour)
+
+	// 2. Siapkan Router
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /v1/verify", verifyHandler)
 
-	port := ":8080"
-	fmt.Printf("🚀 Server Email Guard API menyala di http://localhost%s\n", port)
-	log.Fatal(http.ListenAndServe(port, mux))
+	// 3. Bungkus router dengan Middleware Keamanan RapidAPI
+	securedMux := middleware.RapidAPIAuth(mux)
+
+	// 4. Gunakan PORT dari environment server cloud (default ke 8080 jika di lokal)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("🚀 Server Email Guard API menyala di http://localhost:%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, securedMux))
 }
